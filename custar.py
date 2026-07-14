@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import struct
 import zlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from hashlib import scrypt
 from pathlib import Path, PurePosixPath
@@ -325,9 +325,12 @@ def _process_file(
     file_nonce: bytes,
 ) -> tuple[int, bytes, int, int]:
     raw = fs_path.read_bytes()
+    raw_size = len(raw)
     payload, comp_method = _compress_payload(raw)
+    del raw
     ciphertext = encrypt_payload(key, file_nonce, payload, entry_index)
-    return entry_index, ciphertext, len(raw), comp_method
+    del payload
+    return entry_index, ciphertext, raw_size, comp_method
 
 
 def pack(
@@ -336,7 +339,11 @@ def pack(
     password: str,
     workers: int = 0,
 ) -> None:
-    """Compress/encrypt `src` (file or directory) into CSTA archive `dst`."""
+    """Compress/encrypt `src` (file or directory) into CSTA archive `dst`.
+
+    Ciphertext is written to disk as each file finishes; at most `workers`
+    file payloads are held in memory at once.
+    """
     src_path = Path(src)
     dst_path = Path(dst)
     if workers <= 0:
@@ -386,44 +393,51 @@ def pack(
             )
             file_jobs.append((idx, fp, nonce))
 
-    results: dict[int, tuple[bytes, int, int]] = {}
-    if file_jobs:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {
-                pool.submit(_process_file, key, idx, fp, nonce): idx
-                for idx, fp, nonce in file_jobs
-            }
-            for fut in as_completed(futs):
-                entry_index, ciphertext, raw_size, comp_method = fut.result()
-                results[entry_index] = (ciphertext, raw_size, comp_method)
-
-    body = bytearray()
     flags = 0
-    for idx, e in enumerate(entries):
-        if e.type != TYPE_FILE:
-            continue
-        ciphertext, raw_size, comp_method = results[idx]
-        e.data_offset = len(body)
-        e.cipher_len = len(ciphertext)
-        e.raw_size = raw_size
-        e.comp_method = comp_method
-        if comp_method == ZLIB_METHOD:
-            flags |= FLAG_ZLIB
-        body += ciphertext
-
-    plain_catalog = encode_catalog(entries)
-    header_prefix = MAGIC + struct.pack("<HH", VERSION, flags)
-    catalog_ct = AESGCM(key).encrypt(catalog_nonce, plain_catalog, header_prefix)
-
-    catalog_offset = HEADER_SIZE + len(body)
-    catalog_len = len(catalog_ct)
-    header = _build_header(flags, salt, catalog_offset, catalog_len, catalog_nonce)
-
+    body_len = 0
     dst_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(dst_path, "wb") as f:
-        f.write(header)
-        f.write(body)
-        f.write(catalog_ct)
+    with open(dst_path, "wb") as out:
+        # Placeholder header; rewritten after body + catalog lengths are known.
+        out.write(b"\x00" * HEADER_SIZE)
+
+        if file_jobs:
+            job_iter = iter(file_jobs)
+            in_flight: set = set()
+
+            def _fill(pool: ThreadPoolExecutor) -> None:
+                while len(in_flight) < workers:
+                    try:
+                        idx, fp, nonce = next(job_iter)
+                    except StopIteration:
+                        return
+                    in_flight.add(pool.submit(_process_file, key, idx, fp, nonce))
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                _fill(pool)
+                while in_flight:
+                    done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        entry_index, ciphertext, raw_size, comp_method = fut.result()
+                        e = entries[entry_index]
+                        e.data_offset = body_len
+                        e.cipher_len = len(ciphertext)
+                        e.raw_size = raw_size
+                        e.comp_method = comp_method
+                        if comp_method == ZLIB_METHOD:
+                            flags |= FLAG_ZLIB
+                        out.write(ciphertext)
+                        body_len += len(ciphertext)
+                    _fill(pool)
+
+        plain_catalog = encode_catalog(entries)
+        header_prefix = MAGIC + struct.pack("<HH", VERSION, flags)
+        catalog_ct = AESGCM(key).encrypt(catalog_nonce, plain_catalog, header_prefix)
+        catalog_offset = HEADER_SIZE + body_len
+        catalog_len = len(catalog_ct)
+        header = _build_header(flags, salt, catalog_offset, catalog_len, catalog_nonce)
+        out.write(catalog_ct)
+        out.seek(0)
+        out.write(header)
 
 
 def _safe_dest(root: Path, rel: str) -> Path:
