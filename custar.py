@@ -449,6 +449,14 @@ def _safe_dest(root: Path, rel: str) -> Path:
     return dest
 
 
+def _maybe_restore_executable(dest: Path, data: bytes) -> None:
+    """CSTA does not store mode bits; restore +x for scripts and ELF binaries."""
+    if data.startswith(b"#!") or data.startswith(b"\x7fELF"):
+        mode = dest.stat().st_mode
+        if mode & 0o111 != 0o111:
+            dest.chmod(mode | 0o111)
+
+
 def _extract_one_file(
     key: bytes,
     entry_index: int,
@@ -468,6 +476,7 @@ def _extract_one_file(
     del payload
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
+    _maybe_restore_executable(dest, data)
 
 
 def unpack(
